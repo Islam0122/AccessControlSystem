@@ -116,8 +116,13 @@ class LoginView(generics.GenericAPIView):
 @api_view(['POST'])
 @permission_classes([IsAuthenticatedAndVerified])
 def logout_view(request):
+    # FIX: проверяем, что пользователь аутентифицирован перед доступом к email
+    if request.user.is_authenticated and hasattr(request.user, 'email'):
+        logger.info(f"User logged out: {request.user.email}")
+    else:
+        logger.info("Anonymous user attempted logout")
+
     logout(request)
-    logger.info(f"User logged out: {request.user.email}")
 
     return Response({
         "message": "Успешный выход из системы"
@@ -206,3 +211,4 @@ def test_protected_view(request):
             "roles": [ur.role.name for ur in request.user.roles.all()]
         }
     }, status=status.HTTP_200_OK)
+
