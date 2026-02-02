@@ -1,7 +1,8 @@
-import jwt
-from django.conf import settings
+import logging
 from django.contrib.auth.models import AnonymousUser
-from apps.users.models import User
+from apps.users.authentication import CustomAuthentication
+
+logger = logging.getLogger(__name__)
 
 
 class JWTAuthenticationMiddleware:
@@ -13,35 +14,26 @@ class JWTAuthenticationMiddleware:
 
         if auth_header.startswith('Bearer '):
             token = auth_header.split(' ')[1]
-            user = self.authenticate_token(token)
+            user = self._authenticate_token(token)
+
             if user:
                 request.user = user
+                logger.debug(f"User authenticated via JWT: {user.email}")
             else:
                 request.user = AnonymousUser()
+                logger.debug("JWT authentication failed, user set to AnonymousUser")
         else:
             request.user = AnonymousUser()
 
         response = self.get_response(request)
         return response
 
-    def authenticate_token(self, token):
+    def _authenticate_token(self, token):
         try:
-            payload = jwt.decode(token, settings.SECRET_KEY, algorithms=['HS256'])
-            user_id = payload.get('user_id')
-
-            if not user_id:
-                return None
-
-            user = User.objects.get(id=user_id, is_active=True)
+            user = CustomAuthentication.get_user_from_token(token)
             return user
-
-        except jwt.ExpiredSignatureError:
-            return None
-        except jwt.InvalidTokenError:
-            return None
-        except User.DoesNotExist:
-            return None
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Token authentication failed: {str(e)}")
             return None
 
 
@@ -50,13 +42,15 @@ class RequestLoggingMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
+        from django.conf import settings
+
         if settings.DEBUG:
             user_info = f"User: {request.user}" if hasattr(request, 'user') else "Anonymous"
-            print(f"[REQUEST] {request.method} {request.path} | {user_info}")
+            logger.info(f"[REQUEST] {request.method} {request.path} | {user_info}")
 
         response = self.get_response(request)
 
         if settings.DEBUG:
-            print(f"[RESPONSE] {request.method} {request.path} | Status: {response.status_code}")
+            logger.info(f"[RESPONSE] {request.method} {request.path} | Status: {response.status_code}")
 
         return response

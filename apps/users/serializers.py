@@ -1,115 +1,184 @@
 from rest_framework import serializers
-from django.contrib.auth import authenticate
 from django.utils import timezone
 from datetime import timedelta
 from django.conf import settings
 from .models import User
-import random
-import smtplib
-from email.mime.text import MIMEText
-import jwt
+from .authentication import CustomAuthentication, OTPService
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class RegisterSerializer(serializers.ModelSerializer):
-    password = serializers.CharField(write_only=True, min_length=6)
-    password2 = serializers.CharField(write_only=True, min_length=6)
+    password = serializers.CharField(
+        write_only=True,
+        min_length=6,
+        style={'input_type': 'password'},
+        help_text="Минимум 6 символов"
+    )
+    password2 = serializers.CharField(
+        write_only=True,
+        min_length=6,
+        style={'input_type': 'password'},
+        label="Подтверждение пароля"
+    )
 
     class Meta:
         model = User
-        fields = ['first_name', 'last_name', 'email', 'password', 'password2']
+        fields = ['email', 'first_name', 'last_name', 'password', 'password2']
+
+    def validate_email(self, value):
+        email = value.lower().strip()
+
+        if User.objects.filter(email=email).exists():
+            logger.warning(f"Registration attempt with existing email: {email}")
+            raise serializers.ValidationError("Этот email уже зарегистрирован")
+
+        return email
 
     def validate(self, attrs):
-        if attrs['password'] != attrs['password2']:
-            raise serializers.ValidationError({"password": "Пароли не совпадают"})
-        if User.objects.filter(email=attrs['email']).exists():
-            raise serializers.ValidationError({"email": "Email уже зарегистрирован"})
+        password = attrs.get('password')
+        password2 = attrs.get('password2')
+
+        if password != password2:
+            logger.warning("Password mismatch during registration")
+            raise serializers.ValidationError({
+                "password": "Пароли не совпадают"
+            })
+
+        if len(password) < 6:
+            raise serializers.ValidationError({
+                "password": "Пароль должен содержать минимум 6 символов"
+            })
+
+        if not any(char.isdigit() for char in password):
+            raise serializers.ValidationError({
+                "password": "Пароль должен содержать хотя бы одну цифру"
+            })
+
+        if not any(char.isalpha() for char in password):
+            raise serializers.ValidationError({
+                "password": "Пароль должен содержать хотя бы одну букву"
+            })
+
         return attrs
 
     def create(self, validated_data):
         validated_data.pop('password2')
         password = validated_data.pop('password')
-        user = User.objects.create_user(**validated_data)
+        validated_data['email'] = validated_data['email'].lower().strip()
+        user = User(**validated_data)
         user.set_password(password)
-        user.save()
-
-        self.send_otp_email(user)
-        return user
-
-    def send_otp_email(self, user):
-        otp = str(random.randint(100000, 999999))
-        user.otp_code = otp
+        otp_code = OTPService.generate_otp()
+        user.otp_code = otp_code
         user.otp_expires_at = timezone.now() + timedelta(minutes=10)
         user.save()
+        logger.info(f"New user registered: {user.email}")
+        self._send_otp_email(user)
 
-        subject = "Ваш OTP код для подтверждения email"
-        body = f"Привет, {user.first_name}! Ваш код для подтверждения: {otp}. Он действует 10 минут."
+        return user
+
+    def _send_otp_email(self, user):
+        from django.core.mail import send_mail
+
+        subject = "Подтверждение регистрации - OTP код"
+        message = f"""
+Здравствуйте, {user.first_name}!
+
+Ваш код подтверждения email: {user.otp_code}
+
+Код действителен в течение 10 минут.
+
+Если вы не регистрировались на нашем сайте, проигнорируйте это письмо.
+
+---
+Access Control System
+        """
 
         try:
-            msg = MIMEText(body)
-            msg['Subject'] = subject
-            msg['From'] = settings.EMAIL_HOST_USER
-            msg['To'] = user.email
-
-            server = smtplib.SMTP(settings.EMAIL_HOST, settings.EMAIL_PORT)
-            server.starttls()
-            server.login(settings.EMAIL_HOST_USER, settings.EMAIL_HOST_PASSWORD)
-            server.sendmail(settings.EMAIL_HOST_USER, [user.email], msg.as_string())
-            server.quit()
+            send_mail(
+                subject=subject,
+                message=message,
+                from_email=settings.EMAIL_HOST_USER,
+                recipient_list=[user.email],
+                fail_silently=False,
+            )
+            logger.info(f"OTP email sent successfully to {user.email}")
         except Exception as e:
-            print(f"Ошибка отправки OTP: {e}")
+            logger.error(f"Failed to send OTP email to {user.email}: {str(e)}")
 
 
 class VerifyOtpSerializer(serializers.Serializer):
-    email = serializers.EmailField()
-    otp_code = serializers.CharField(max_length=6)
+    email = serializers.EmailField(
+        help_text="Email адрес пользователя"
+    )
+    otp_code = serializers.CharField(
+        max_length=6,
+        min_length=6,
+        help_text="6-значный OTP код"
+    )
 
     def validate(self, attrs):
-        email = attrs.get('email')
+        email = attrs.get('email').lower().strip()
         otp_code = attrs.get('otp_code')
 
         try:
             user = User.objects.get(email=email)
         except User.DoesNotExist:
+            logger.warning(f"OTP verification attempt for non-existent user: {email}")
             raise serializers.ValidationError("Пользователь не найден")
 
         if user.is_verified:
-            raise serializers.ValidationError("Пользователь уже подтверждён")
+            logger.info(f"OTP verification attempt for already verified user: {email}")
+            raise serializers.ValidationError("Email уже подтверждён")
 
-        if user.otp_code != otp_code:
-            raise serializers.ValidationError("Неверный OTP код")
-
-        if timezone.now() > user.otp_expires_at:
-            raise serializers.ValidationError("OTP код истёк")
+        if not OTPService.verify_otp(user, otp_code):
+            raise serializers.ValidationError("Неверный или истёкший OTP код")
 
         user.is_verified = True
         user.otp_code = None
         user.otp_expires_at = None
-        user.save()
+        user.save(update_fields=['is_verified', 'otp_code', 'otp_expires_at'])
+
+        logger.info(f"Email verified successfully for user: {email}")
 
         attrs['user'] = user
         return attrs
 
 
 class LoginSerializer(serializers.Serializer):
-    email = serializers.EmailField()
-    password = serializers.CharField(write_only=True)
-    token = serializers.CharField(read_only=True)
+    email = serializers.EmailField(
+        help_text="Email адрес для входа"
+    )
+    password = serializers.CharField(
+        write_only=True,
+        style={'input_type': 'password'},
+        help_text="Пароль"
+    )
+    token = serializers.CharField(
+        read_only=True,
+        help_text="JWT токен для последующих запросов"
+    )
 
     def validate(self, attrs):
         email = attrs.get('email')
         password = attrs.get('password')
 
-        user = authenticate(email=email, password=password)
-        if not user:
-            raise serializers.ValidationError("Неверные данные для входа")
-        if not user.is_active:
-            raise serializers.ValidationError("Пользователь деактивирован")
-        if not user.is_verified:
-            raise serializers.ValidationError("Email не подтверждён")
+        if not email or not password:
+            logger.warning("Login attempt with missing email or password")
+            raise serializers.ValidationError("Email и пароль обязательны")
 
-        payload = {"user_id": user.id, "email": user.email}
-        token = jwt.encode(payload, settings.SECRET_KEY, algorithm="HS256")
+        try:
+            user = CustomAuthentication.authenticate_user(email, password)
+        except ValueError as e:
+            raise serializers.ValidationError(str(e))
+
+        if not user:
+            raise serializers.ValidationError("Неверный email или пароль")
+        token = CustomAuthentication.generate_jwt_token(user)
         attrs['token'] = token
+        attrs['user'] = user
+        logger.info(f"User logged in successfully: {email}")
         return attrs
 
 
@@ -120,9 +189,28 @@ class UpdateProfileSerializer(serializers.ModelSerializer):
 
     def validate_email(self, value):
         user = self.context['request'].user
-        if User.objects.exclude(id=user.id).filter(email=value).exists():
-            raise serializers.ValidationError("Email уже используется")
-        return value
+        email = value.lower().strip()
+
+        if User.objects.exclude(id=user.id).filter(email=email).exists():
+            logger.warning(f"Profile update attempt with existing email: {email}")
+            raise serializers.ValidationError("Этот email уже используется")
+
+        return email
+
+    def update(self, instance, validated_data):
+        email_changed = 'email' in validated_data and validated_data['email'] != instance.email
+        instance = super().update(instance, validated_data)
+        if email_changed:
+            instance.is_verified = False
+            otp_code = OTPService.generate_otp()
+            instance.otp_code = otp_code
+            instance.otp_expires_at = timezone.now() + timedelta(minutes=10)
+
+            instance.save(update_fields=['is_verified', 'otp_code', 'otp_expires_at'])
+
+            logger.info(f"Email changed for user {instance.id}, verification required")
+
+        return instance
 
 
 class SoftDeleteSerializer(serializers.ModelSerializer):
@@ -133,12 +221,29 @@ class SoftDeleteSerializer(serializers.ModelSerializer):
     def save(self, **kwargs):
         user = self.instance
         user.is_active = False
-        user.save()
+        user.save(update_fields=['is_active'])
+
+        logger.info(f"User account soft deleted: {user.email}")
         return user
 
 
 class ProfileSerializer(serializers.ModelSerializer):
+    roles = serializers.SerializerMethodField()
+
     class Meta:
         model = User
-        fields = ['id', 'first_name', 'last_name', 'email', 'is_verified', 'date_joined']
+        fields = [
+            'id',
+            'email',
+            'first_name',
+            'last_name',
+            'is_verified',
+            'is_active',
+            'date_joined',
+            'last_login',
+            'roles'
+        ]
         read_only_fields = fields
+
+    def get_roles(self, obj):
+        return [ur.role.name for ur in obj.roles.all()]
